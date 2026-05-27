@@ -10,3 +10,5 @@ pretrained_models/
 res_ca_au_split/
 test_res/
 timing_report.log
+pre_post_process/cpp/build/
+AGENTS.md

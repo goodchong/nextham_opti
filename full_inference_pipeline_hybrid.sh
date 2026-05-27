@@ -19,16 +19,14 @@ FERMI_ENERGY="13.97"
 echo "========================================="
 echo " Step 1: Pre-processing (C++ Engine)"
 echo "========================================="
-# Generate STRU file from STRU.cif using python to ensure uniform CIF cell/positions orientation
-${PYTHON_EXEC} -c "from ase.io import read, write; atoms = read('${TARGET_DIR}/OUT.ABACUS/STRU.cif', format='cif'); write('${DATA_DIR}/STRU', atoms, format='abacus', scaled=True)"
-
-# Run the C++ pre-processing executable with the generated STRU file
+# Read CIF input directly in the C++ pre-processing executable.
 ./pre_post_process/cpp/build/nextham_preprocess \
-    "${DATA_DIR}/STRU" \
+    "${TARGET_DIR}/OUT.ABACUS/STRU.cif" \
     "${TARGET_DIR}/OUT.ABACUS/" \
     4 \
     8.0 \
-    "${OUTPUT_PTH}"
+    "${OUTPUT_PTH}" \
+    --format cif
 
 echo "========================================="
 echo " Step 1.5: Generating infer_ori.txt"
@@ -43,17 +41,3 @@ echo " Step 2: Combine Data and Run Inference"
 echo "========================================="
 # Combine data and run the inference script
 ${PYTHON_EXEC} combine_data_infer.py
-sh scripts/infer/infer.sh
-
-echo "========================================="
-echo " Step 3: Post-processing"
-echo "========================================="
-# Finalize results and generate plots
-${PYTHON_EXEC} pre_post_process/post_process.py \
-    --prediction-path "${BASE_DIR}/data/cpp_input_inference_out.pth" \
-    --stru-file "${TARGET_DIR}/OUT.ABACUS/STRU.cif" \
-    --data-dir "${TARGET_DIR}/OUT.ABACUS" \
-    --save-path "res_ca_au_split/plots/" \
-    --fermi ${FERMI_ENERGY}
-
-echo "Pipeline finished successfully!"

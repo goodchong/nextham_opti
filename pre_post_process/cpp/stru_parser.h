@@ -29,4 +29,5 @@ struct StruData {
 class StruParser {
 public:
     static StruData parse(const std::string& filename);
+    static StruData parse_cif(const std::string& filename);
 };

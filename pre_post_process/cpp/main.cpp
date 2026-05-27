@@ -13,7 +13,7 @@ namespace fs = std::filesystem;
 
 int main(int argc, char** argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <stru_file> <data_dir> <nspin> <cutoff> <output_pth>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <structure_file> <data_dir> <nspin> <cutoff> <output_pth> [--format stru|cif]" << std::endl;
         return 1;
     }
 
@@ -22,15 +22,32 @@ int main(int argc, char** argv) {
     int nspin = std::stoi(argv[3]);
     double cutoff = std::stod(argv[4]);
     std::string output_pth = argv[5];
+    std::string structure_format = "stru";
+    for (int i = 6; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--format" && i + 1 < argc) {
+            structure_format = argv[++i];
+        } else {
+            std::cerr << "Unknown or incomplete option: " << arg << std::endl;
+            return 1;
+        }
+    }
+    if (structure_format != "stru" && structure_format != "cif") {
+        std::cerr << "Unsupported structure format: " << structure_format
+                  << " (expected stru or cif)" << std::endl;
+        return 1;
+    }
 
     try {
         auto total_start = std::chrono::high_resolution_clock::now();
 
         auto start = std::chrono::high_resolution_clock::now();
-        std::cout << "Parsing STRU..." << std::endl;
-        auto stru_data = StruParser::parse(stru_file);
+        std::cout << "Parsing " << structure_format << " structure..." << std::endl;
+        auto stru_data = structure_format == "cif"
+            ? StruParser::parse_cif(stru_file)
+            : StruParser::parse(stru_file);
         auto end = std::chrono::high_resolution_clock::now();
-        std::cout << "  STRU parsing took: " << std::chrono::duration<double>(end - start).count() << " s" << std::endl;
+        std::cout << "  Structure parsing took: " << std::chrono::duration<double>(end - start).count() << " s" << std::endl;
 
         TransformationEngine::ProcessedData processed;
         TransformationEngine engine(nspin);
@@ -121,4 +138,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
