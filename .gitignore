@@ -1,0 +1,12 @@
+.antigravitycli/
+1000atom/
+Out/
+__pycache__/
+data/
+        datasets/
+        get_hs_res/
+        pkg/
+        pretrained_models/
+        res_ca_au_split/
+        test_res/
+        timing_report.log
