@@ -197,6 +197,10 @@ def get_args_parser():
     parser.add_argument('--checkpoint-path2', type=str, default=None)
     parser.add_argument('--checkpoint-path3', type=str, default=None)
     parser.add_argument('--checkpoint-path4', type=str, default=None)
+    parser.add_argument('--model-cache-path', type=str, default='./model_cache/infer_models.pt',
+                        help='Path to cache fully initialized inference models. Set to "" to disable.')
+    parser.add_argument('--refresh-model-cache', action='store_true',
+                        help='Rebuild models and overwrite the model cache.')
 
     parser.add_argument('--evaluate', action='store_true', dest='evaluate')
     parser.set_defaults(evaluate=False)
@@ -331,6 +335,108 @@ def get_hamiltonian_size(args, spinful):
     return irreps_edge, construct_kernel
 
 
+def torch_load_compat(path, **kwargs):
+    try:
+        return torch.load(path, **kwargs)
+    except TypeError as err:
+        if 'weights_only' not in str(err):
+            raise
+        kwargs.pop('weights_only', None)
+        return torch.load(path, **kwargs)
+
+
+def checkpoint_fingerprint(checkpoint_path):
+    if checkpoint_path is None:
+        return None
+    checkpoint = Path(checkpoint_path).expanduser()
+    if not checkpoint.exists():
+        return {'path': str(checkpoint), 'missing': True}
+    stat = checkpoint.stat()
+    return {
+        'path': str(checkpoint.resolve()),
+        'size': stat.st_size,
+        'mtime_ns': stat.st_mtime_ns,
+    }
+
+
+def model_cache_metadata(args, checkpoint_paths):
+    return {
+        'cache_version': 1,
+        'model_name': args.model_name,
+        'input_irreps': args.input_irreps,
+        'radius': args.radius,
+        'num_basis': args.num_basis,
+        'start_layer': args.start_layer,
+        'drop_path': args.drop_path,
+        'with_trace': args.with_trace,
+        'trace_out_len': args.trace_out_len,
+        'checkpoints': [checkpoint_fingerprint(path) for path in checkpoint_paths],
+    }
+
+
+def load_cached_models(cache_path, expected_metadata, device):
+    cache_file = Path(cache_path).expanduser()
+    if not cache_file.exists():
+        return None
+    print(f'Loading initialized models from cache: {cache_file}', flush=True)
+    payload = torch_load_compat(cache_file, map_location=device, weights_only=False)
+    if not isinstance(payload, dict) or payload.get('metadata') != expected_metadata:
+        print('Model cache metadata mismatch; rebuilding models.', flush=True)
+        return None
+    models = payload['models']
+    for model in models:
+        model.to(device)
+    print('Loaded initialized models from cache.', flush=True)
+    return models
+
+
+def save_cached_models(cache_path, metadata, models):
+    cache_file = Path(cache_path).expanduser()
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({'metadata': metadata, 'models': models}, cache_file)
+    print(f'Saved initialized models to cache: {cache_file}', flush=True)
+
+
+def build_or_load_models(args, irreps_edge, mean, std, device):
+    checkpoint_paths = [args.checkpoint_path1, args.checkpoint_path2, args.checkpoint_path3, args.checkpoint_path4]
+    cache_path = args.model_cache_path
+    metadata = model_cache_metadata(args, checkpoint_paths)
+
+    if cache_path and not args.refresh_model_cache:
+        cached_models = load_cached_models(cache_path, metadata, device)
+        if cached_models is not None:
+            return cached_models
+
+    create_model = model_entrypoint(args.model_name)
+    models = []
+    for model_idx in range(4):
+        models.append(create_model(irreps_in=args.input_irreps, irreps_edge=irreps_edge,
+            radius=args.radius,
+            num_basis=args.num_basis,
+            task_mean=mean,
+            task_std=std,
+            atomref=None,
+            start_layer=args.start_layer,
+            drop_path_rate=args.drop_path,
+            with_trace=args.with_trace,
+            trace_out_len=args.trace_out_len,
+            use_w2v=False,
+            ).to(device))
+
+    for model_idx in range(4):
+        checkpoint_path = checkpoint_paths[model_idx]
+        if checkpoint_path is not None:
+            state_dict = torch_load_compat(checkpoint_path, map_location='cpu', weights_only=False)['state_dict']
+            models[model_idx].load_state_dict(state_dict)
+            print('load pre-trained model', flush=True)
+        else:
+            print('no pre-trained model', flush=True)
+
+    if cache_path:
+        save_cached_models(cache_path, metadata, models)
+    return models
+
+
 def main(args):
 
 
@@ -353,36 +459,8 @@ def main(args):
 
 
     ''' Network '''
-    create_model = model_entrypoint(args.model_name)
-
     device = 'cpu'
-
-    models = []
-
-    for model_idx in range(4):
-        models.append(create_model(irreps_in=args.input_irreps, irreps_edge=irreps_edge,
-            radius=args.radius, 
-            num_basis=args.num_basis, 
-            task_mean=mean, 
-            task_std=std, 
-            atomref=None,
-            start_layer=args.start_layer,
-            drop_path_rate=args.drop_path,
-            with_trace=args.with_trace,
-            trace_out_len=args.trace_out_len,
-            use_w2v=False,
-            ).to(device))
-
-    checkpoint_paths = [args.checkpoint_path1, args.checkpoint_path2, args.checkpoint_path3, args.checkpoint_path4]
-
-    for model_idx in range(4):
-        checkpoint_path = checkpoint_paths[model_idx]
-        if checkpoint_path is not None:
-            state_dict = torch.load(checkpoint_path, map_location='cpu')['state_dict']
-            models[model_idx].load_state_dict(state_dict)
-            print('load pre-trained model')
-        else:
-            print('no pre-trained model')
+    models = build_or_load_models(args, irreps_edge, mean, std, device)
 
 
     n_parameters = sum(p.numel() for p in models[0].parameters())*4
@@ -402,7 +480,7 @@ def main(args):
     ls = [1, 1, 1, 1, 3, 3, 5, 5, 7]
     total_process_sample = 0 
     with torch.inference_mode():
-        infer_loader = DataLoader(infer_dataset, batch_size=1, shuffle=False, num_workers=1, pin_memory = False)
+        infer_loader = DataLoader(infer_dataset, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory = False)
         print(f"Infer loader length: {len(infer_loader)}")        
         for step, data in enumerate(infer_loader):
             file_path, H0_ds, edge_vec, edge_src, edge_dst, ele_list, H0_raw, mask_tensor_raw = data
