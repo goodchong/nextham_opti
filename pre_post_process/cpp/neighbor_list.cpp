@@ -3,6 +3,9 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <array>
+#include <iterator>
+#include <omp.h>
 
 std::vector<Edge> NeighborList::build(const StruData& data, double cutoff) {
     std::vector<Edge> edges;
@@ -49,17 +52,22 @@ std::vector<Edge> NeighborList::build(const StruData& data, double cutoff) {
 
     double cutoff_sq = cutoff * cutoff;
 
-    // Grid search implementation
-    // For n=10,000, we should use a proper cell list.
-    int gx = std::max(1, (int)(h0 / (cutoff + 1e-6)));
-    int gy = std::max(1, (int)(h1 / (cutoff + 1e-6)));
-    int gz = std::max(1, (int)(h2 / (cutoff + 1e-6)));
+    // Cell-list search.  Grid cells are chosen in fractional coordinates, with
+    // each axis bounded by the real-space cell height.  For a candidate within
+    // cutoff, each fractional component must be within cutoff / height, so the
+    // per-axis interval below is a safe superset even for skewed cells.
+    int gx = std::max(1, (int)std::floor(h0 / (cutoff + 1e-6)));
+    int gy = std::max(1, (int)std::floor(h1 / (cutoff + 1e-6)));
+    int gz = std::max(1, (int)std::floor(h2 / (cutoff + 1e-6)));
+    std::array<int, 3> grid_shape = {gx, gy, gz};
+    std::array<double, 3> search_margin = {
+        cutoff / h0,
+        cutoff / h1,
+        cutoff / h2,
+    };
     
     std::vector<std::vector<int>> grid(gx * gy * gz);
-    auto get_grid_idx = [&](int ix, int iy, int iz) {
-        ix = (ix % gx + gx) % gx;
-        iy = (iy % gy + gy) % gy;
-        iz = (iz % gz + gz) % gz;
+    auto get_grid_idx = [&](int ix, int iy, int iz) -> int {
         return ix * gy * gz + iy * gz + iz;
     };
 
@@ -70,54 +78,81 @@ std::vector<Edge> NeighborList::build(const StruData& data, double cutoff) {
         grid[ix * gy * gz + iy * gz + iz].push_back(i);
     }
 
-    for (int i = 0; i < n; ++i) {
-        Eigen::Vector3d pi = frac_pos[i];
-        int ix = (int)(pi(0) * gx);
-        int iy = (int)(pi(1) * gy);
-        int iz = (int)(pi(2) * gz);
+    int num_threads = std::max(1, omp_get_max_threads());
+    std::vector<std::vector<Edge>> thread_edges(num_threads);
 
-        // Check surrounding cells including images
-        // For each atom i, we look for j in (central cell + R)
-        // This is equivalent to looking for j in central cell, and checking all R
-        // that could bring j within cutoff of i.
-        
-        for (int rx = -nrx; rx <= nrx; ++rx) {
-            for (int ry = -nry; ry <= nry; ++ry) {
-                for (int rz = -nrz; rz <= nrz; ++rz) {
-                    // Shifted fractional position of i to check against j in central cell
-                    // d = pj - (pi - R)
-                    // This is still slightly inefficient if we don't use the grid for j.
-                    
-                    // Correct grid search:
-                    // Find grid cells in central cell that are within cutoff of (pi - R)
-                    Eigen::Vector3d center_in_frac = pi - Eigen::Vector3d(rx, ry, rz);
-                    // Range of cells in fractional units: [center - cutoff_frac, center + cutoff_frac]
-                    // But easier: just iterate over all j and R. 
-                    // To be fast for 10,000 atoms, we MUST use the grid.
-                    
-                    // Actually, for each i, we only need to check R such that 
-                    // the image cell (central cell + R) is within cutoff of pi.
-                }
-            }
+    auto get_cell_range = [](double lo, double hi, int g, int& c0, int& c1) -> bool {
+        if (hi < 0.0 || lo >= 1.0) {
+            return false;
         }
-        
-        // Re-simplified efficient version:
-        for (int rx = -nrx; rx <= nrx; ++rx) {
-            for (int ry = -nry; ry <= nry; ++ry) {
-                for (int rz = -nrz; rz <= nrz; ++rz) {
-                    Eigen::Vector3d R_vec(rx, ry, rz);
-                    for (int j = 0; j < n; ++j) {
-                        Eigen::Vector3d d_frac = frac_pos[j] + R_vec - pi;
-                        Eigen::Vector3d d_cart = lat.transpose() * d_frac;
-                        double d2 = d_cart.squaredNorm();
-                        if (d2 < cutoff_sq) {
-                            edges.push_back({i, j, d_cart, {rx, ry, rz}, std::sqrt(d2)});
+        lo = std::max(0.0, lo);
+        hi = std::min(std::nextafter(1.0, 0.0), hi);
+        c0 = std::max(0, std::min(g - 1, (int)std::floor(lo * g)));
+        c1 = std::max(0, std::min(g - 1, (int)std::floor(hi * g)));
+        return c0 <= c1;
+    };
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        auto& local_edges = thread_edges[tid];
+
+        #pragma omp for schedule(dynamic, 16)
+        for (int i = 0; i < n; ++i) {
+            Eigen::Vector3d pi = frac_pos[i];
+
+            for (int rx = -nrx; rx <= nrx; ++rx) {
+                for (int ry = -nry; ry <= nry; ++ry) {
+                    for (int rz = -nrz; rz <= nrz; ++rz) {
+                        Eigen::Vector3d center = pi - Eigen::Vector3d(rx, ry, rz);
+                        int c0[3];
+                        int c1[3];
+                        bool has_cells = true;
+                        for (int axis = 0; axis < 3; ++axis) {
+                            double lo = center(axis) - search_margin[axis];
+                            double hi = center(axis) + search_margin[axis];
+                            if (!get_cell_range(lo, hi, grid_shape[axis], c0[axis], c1[axis])) {
+                                has_cells = false;
+                                break;
+                            }
+                        }
+                        if (!has_cells) {
+                            continue;
+                        }
+
+                        Eigen::Vector3d R_vec(rx, ry, rz);
+                        for (int cx = c0[0]; cx <= c1[0]; ++cx) {
+                            for (int cy = c0[1]; cy <= c1[1]; ++cy) {
+                                for (int cz = c0[2]; cz <= c1[2]; ++cz) {
+                                    const auto& candidates = grid[get_grid_idx(cx, cy, cz)];
+                                    for (int j : candidates) {
+                                        Eigen::Vector3d d_frac = frac_pos[j] + R_vec - pi;
+                                        Eigen::Vector3d d_cart = lat.transpose() * d_frac;
+                                        double d2 = d_cart.squaredNorm();
+                                        if (d2 < cutoff_sq) {
+                                            local_edges.push_back({i, j, d_cart, {rx, ry, rz}, std::sqrt(d2)});
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    size_t total_edges = 0;
+    for (const auto& local_edges : thread_edges) {
+        total_edges += local_edges.size();
+    }
+    edges.reserve(total_edges);
+    for (auto& local_edges : thread_edges) {
+        edges.insert(edges.end(),
+                     std::make_move_iterator(local_edges.begin()),
+                     std::make_move_iterator(local_edges.end()));
+    }
+
     // Sort edges for consistency as in Python
     std::sort(edges.begin(), edges.end(), [](const Edge& a, const Edge& b) {
         if (a.r_offset(0) != b.r_offset(0)) return a.r_offset(0) < b.r_offset(0);
