@@ -31,6 +31,7 @@ from dataset_nano import nanotube_weak, config_set_target, DatasetInfo
 from operator import itemgetter
 from scipy.linalg import block_diag
 from tg_src.graph import Collater
+from nxraw_io import StepProfiler, load_nxraw_sample
 
 
 ModelEma = ModelEmaV2
@@ -201,6 +202,10 @@ def get_args_parser():
                         help='Path to cache fully initialized inference models. Set to "" to disable.')
     parser.add_argument('--refresh-model-cache', action='store_true',
                         help='Rebuild models and overwrite the model cache.')
+    parser.add_argument('--input-format', choices=('torch', 'nxraw'), default='torch',
+                        help='Input data format listed in datasets/infer.txt.')
+    parser.add_argument('--profile-infer-data', action='store_true',
+                        help='Print fine-grained timing for infer data loading and in-memory combine.')
 
     parser.add_argument('--evaluate', action='store_true', dest='evaluate')
     parser.set_defaults(evaluate=False)
@@ -282,11 +287,87 @@ def get_WA_data(WA_data_root):
     return results
 
 
+def _tensor_summary(name, tensor):
+    if not torch.is_tensor(tensor):
+        return f"{name}=non_tensor({type(tensor).__name__})"
+    return (
+        f"{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+        f"device={tensor.device}, contiguous={tensor.is_contiguous()}"
+    )
+
+
+def combine_nxraw_sample(raw_sample, construct_kernel, profiler):
+    H0 = raw_sample["descriptor"]
+    mask_tensor = raw_sample["mask"]
+    edge_vec = raw_sample["edge_vec"]
+    edge_src = raw_sample["edge_src"]
+    edge_dst = raw_sample["edge_dst"]
+    profiler.log(
+        "; ".join([
+            _tensor_summary("nxraw_descriptor", H0),
+            _tensor_summary("nxraw_mask", mask_tensor),
+            _tensor_summary("nxraw_edge_vec", edge_vec),
+            _tensor_summary("nxraw_edge_src", edge_src),
+            _tensor_summary("nxraw_edge_dst", edge_dst),
+        ])
+    )
+
+    with profiler.step("nxraw combine compute node_num"):
+        node_num = max(int(edge_src.max().item()) + 1, int(edge_dst.max().item()) + 1)
+    with profiler.step("nxraw combine scale H0 raw"):
+        H0_raw = H0 * 13.6
+    with profiler.step("nxraw combine reshape H0 to spin blocks"):
+        H0_blocks = H0_raw.reshape((H0_raw.shape[0], 2, 27, 2, 27))
+
+    H0_convert_list = []
+    ls = [1, 1, 1, 1, 3, 3, 5, 5, 7]
+    for d1 in [0, 1]:
+        for d2 in [0, 1]:
+            with profiler.step(f"nxraw combine convert H0 spin block d1={d1} d2={d2}"):
+                descriptor_list = []
+                a = 0
+                for i in ls:
+                    b = 0
+                    for j in ls:
+                        descriptor_list.append(H0_blocks[:, d1, a:a+i, d2, b:b+j].reshape(H0_blocks.shape[0], -1))
+                        b += j
+                    a += i
+                H0_convert_list.append(torch.cat(descriptor_list, dim=-1).reshape((-1, 1, 27 * 27)))
+    with profiler.step("nxraw combine cat converted H0 spin blocks"):
+        H0_project_input = torch.cat(H0_convert_list, dim=1)
+    profiler.log(_tensor_summary("nxraw_H0_before_get_net_out", H0_project_input))
+    with profiler.step("nxraw combine construct_kernel.get_net_out(H0)"):
+        H0_ds = construct_kernel.get_net_out(H0_project_input)
+    profiler.log(_tensor_summary("nxraw_H0_ds_after_get_net_out", H0_ds))
+    with profiler.step("nxraw combine reshape and permute mask"):
+        mask_tensor_raw = mask_tensor.reshape((-1, 27, 2, 27, 2))
+        mask_tensor_raw = mask_tensor_raw.permute(0, 2, 1, 4, 3).reshape((-1, 54, 54))
+    with profiler.step("nxraw combine build node_atom"):
+        node_atom_values = [ele_dict[element] for element in raw_sample["atom_elements"]]
+        node_atom = torch.tensor(node_atom_values, dtype=torch.long)
+
+    output_file = str(Path(raw_sample["sample_dir"]) / raw_sample["output_path"])
+    return {
+        "file_path": raw_sample["sample_dir"],
+        "output_file": output_file,
+        "H0_ds": H0_ds,
+        "edge_vec": edge_vec.reshape(edge_vec.shape[0], -1),
+        "edge_src": edge_src.reshape(-1),
+        "edge_dst": edge_dst.reshape(-1),
+        "node_num": node_num,
+        "node_atom": node_atom,
+        "H0_raw": H0_raw,
+        "mask_tensor_raw": mask_tensor_raw,
+    }
+
+
 class Material_Project_Dataset(torch.utils.data.Dataset):
-    def __init__(self, mode, construct_kernel, device, dataset_root='./datasets/'):
+    def __init__(self, mode, construct_kernel, device, dataset_root='./datasets/', input_format='torch', profiler=None):
         super().__init__()
         self.mode = mode
         self.construct_kernel = construct_kernel
+        self.input_format = input_format
+        self.profiler = profiler or StepProfiler(False, prefix="infer-data")
         self.samples = []
         self.label_norm_tensor = None
         self.descriptor_norm_tensor = None
@@ -304,16 +385,24 @@ class Material_Project_Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         file_path = self.file_list[idx]
-        return torch.load(file_path, weights_only=True)
+        if self.input_format == 'nxraw':
+            raw_sample = load_nxraw_sample(file_path, mmap=True, profiler=self.profiler)
+            return combine_nxraw_sample(raw_sample, self.construct_kernel, self.profiler)
+        with self.profiler.step("torch input torch.load sample"):
+            return torch.load(file_path, weights_only=True)
     
 
-def get_material_project_dataset(construct_kernel, device, only_infer = True):
+def get_material_project_dataset(construct_kernel, device, only_infer = True, input_format='torch', profiler=None):
     if only_infer:
-        return Material_Project_Dataset('infer', construct_kernel, device)
+        return Material_Project_Dataset('infer', construct_kernel, device, input_format=input_format, profiler=profiler)
 
     datasets = {}
 
-    datasets["train"], datasets["val"], datasets["test"] = Material_Project_Dataset('train', construct_kernel, device), Material_Project_Dataset('val', construct_kernel, device), Material_Project_Dataset('test', construct_kernel, device)
+    datasets["train"], datasets["val"], datasets["test"] = (
+        Material_Project_Dataset('train', construct_kernel, device, input_format=input_format, profiler=profiler),
+        Material_Project_Dataset('val', construct_kernel, device, input_format=input_format, profiler=profiler),
+        Material_Project_Dataset('test', construct_kernel, device, input_format=input_format, profiler=profiler),
+    )
 
     return datasets["train"], datasets["val"], datasets["test"]
 
@@ -467,7 +556,14 @@ def main(args):
     _log.info('Number of params: {}'.format(n_parameters))
 
     ''' Dataset '''
-    infer_dataset = get_material_project_dataset(construct_kernel = construct_kernel, device=device, only_infer=True)
+    data_profiler = StepProfiler(args.profile_infer_data, prefix="infer-data")
+    infer_dataset = get_material_project_dataset(
+        construct_kernel=construct_kernel,
+        device=device,
+        only_infer=True,
+        input_format=args.input_format,
+        profiler=data_profiler,
+    )
 
     _log.info('')
     _log.info('Infering set size:    {}\n'.format(len(infer_dataset)))
@@ -480,21 +576,41 @@ def main(args):
     ls = [1, 1, 1, 1, 3, 3, 5, 5, 7]
     total_process_sample = 0 
     with torch.inference_mode():
-        infer_loader = DataLoader(infer_dataset, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory = False)
-        print(f"Infer loader length: {len(infer_loader)}")        
-        for step, data in enumerate(infer_loader):
-            file_path, H0_ds, edge_vec, edge_src, edge_dst, ele_list, H0_raw, mask_tensor_raw = data
-            file_path, H0_ds, edge_vec, edge_src, edge_dst, H0_raw, mask_tensor_raw = file_path[0], H0_ds[0].to(device, non_blocking=True), edge_vec[0].to(device, non_blocking=True), edge_src.to(torch.int64)[0].to(device, non_blocking=True), edge_dst.to(torch.int64)[0].to(device, non_blocking=True), H0_raw[0].to(device, non_blocking=True), mask_tensor_raw[0].to(device, non_blocking=True)      
-            node_num = max(int(max(edge_src)+1), int(max(edge_dst)+1))
+        if args.input_format == 'nxraw':
+            infer_iter = ((step, infer_dataset[step]) for step in range(len(infer_dataset)))
+            print(f"Infer nxraw dataset length: {len(infer_dataset)}")
+        else:
+            infer_loader = DataLoader(infer_dataset, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory = False)
+            infer_iter = enumerate(infer_loader)
+            print(f"Infer loader length: {len(infer_loader)}")
+
+        for step, data in infer_iter:
+            if args.input_format == 'nxraw':
+                file_path = data["file_path"]
+                output_file = data["output_file"]
+                H0_ds = data["H0_ds"].to(device, non_blocking=True)
+                edge_vec = data["edge_vec"].to(device, non_blocking=True)
+                edge_src = data["edge_src"].to(torch.int64).to(device, non_blocking=True)
+                edge_dst = data["edge_dst"].to(torch.int64).to(device, non_blocking=True)
+                H0_raw = data["H0_raw"].to(device, non_blocking=True)
+                mask_tensor_raw = data["mask_tensor_raw"].to(device, non_blocking=True)
+                node_num = data["node_num"]
+                node_atom = data["node_atom"].to(device, non_blocking=True)
+            else:
+                file_path, H0_ds, edge_vec, edge_src, edge_dst, ele_list, H0_raw, mask_tensor_raw = data
+                file_path, H0_ds, edge_vec, edge_src, edge_dst, H0_raw, mask_tensor_raw = file_path[0], H0_ds[0].to(device, non_blocking=True), edge_vec[0].to(device, non_blocking=True), edge_src.to(torch.int64)[0].to(device, non_blocking=True), edge_dst.to(torch.int64)[0].to(device, non_blocking=True), H0_raw[0].to(device, non_blocking=True), mask_tensor_raw[0].to(device, non_blocking=True)
+                output_file = file_path.replace('.pth', '_out.pth')
+                node_num = max(int(max(edge_src)+1), int(max(edge_dst)+1))
        
             print(visualize_zero(mask_tensor_raw.reshape((-1, 2, 27, 2, 27))[0, 0, :, 0, :]))
             # import pdb; pdb.set_trace()
 
             batch = torch.ones((node_num,), dtype=torch.int32).to(device, non_blocking=True)
-            node_atom = [-1 for _ in range(node_num)]
-            for ele_idx in range(len(ele_list)):
-                node_atom[edge_src[ele_idx]] = ele_dict[ele_list[ele_idx][0][0]]
-            node_atom = torch.tensor(node_atom, dtype=torch.long, device=device)
+            if args.input_format != 'nxraw':
+                node_atom = [-1 for _ in range(node_num)]
+                for ele_idx in range(len(ele_list)):
+                    node_atom[edge_src[ele_idx]] = ele_dict[ele_list[ele_idx][0][0]]
+                node_atom = torch.tensor(node_atom, dtype=torch.long, device=device)
             pred_h_direct_sum = None
             for m_idx in range(4):
                 model = models[m_idx]
@@ -521,7 +637,9 @@ def main(args):
             H_pred[:, 0, :, 0, :].real = H_pred[:, 0, :, 0, :].real + delta_H_pred_real
             H_pred[:, 1, :, 1, :].real = H_pred[:, 1, :, 1, :].real + delta_H_pred_real 
             H_pred = H_pred.reshape(-1, 54, 54)
-            torch.save((None, H_pred, None, None, mask_tensor_raw, edge_vec, edge_src, edge_dst, ele_dict), file_path.replace('.pth', '_out.pth'))
+            with data_profiler.step("infer torch.save output sample"):
+                torch.save((None, H_pred, None, None, mask_tensor_raw, edge_vec, edge_src, edge_dst, ele_dict), output_file)
+    data_profiler.summary()
 
 if __name__ == "__main__":
     set_seed()
