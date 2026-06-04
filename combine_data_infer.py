@@ -4,6 +4,7 @@ import itertools
 import pickle
 import subprocess
 import time
+from contextlib import contextmanager
 import torch
 import numpy as np
 import random
@@ -150,6 +151,8 @@ def get_args_parser():
     parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
                         help='')
     parser.set_defaults(pin_mem=True)
+    parser.add_argument('--profile-combine', action='store_true',
+                        help='Print fine-grained timing for the combine-data stage.')
     # evaluation
     parser.add_argument('--checkpoint-path1', type=str, default=None)
     parser.add_argument('--checkpoint-path2', type=str, default=None)
@@ -196,45 +199,175 @@ def reverse_transform_matrix(tensor, ls):
     return original
 
 
-def Process_Material_Dataset(mode, construct_kernel, root='./datasets/', save_pth_root = './data/'):
-    dataset_file_r = open(root+mode+'_ori.txt', "r")
-    dataset_file_w = open(root+mode+'.txt', "w")
+def _format_bytes(num_bytes):
+    if num_bytes is None:
+        return "unknown"
+    sign = "-" if num_bytes < 0 else ""
+    size = abs(float(num_bytes))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024.0:
+            return f"{sign}{size:.2f}{unit}"
+        size /= 1024.0
+    return f"{sign}{size:.2f}PiB"
+
+
+def _current_rss_bytes():
+    try:
+        with open("/proc/self/status", "r") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def _tensor_summary(name, tensor):
+    if not torch.is_tensor(tensor):
+        return f"{name}=non_tensor({type(tensor).__name__})"
+    return (
+        f"{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+        f"device={tensor.device}, contiguous={tensor.is_contiguous()}"
+    )
+
+
+class CombineProfiler:
+    def __init__(self, enabled=False):
+        self.enabled = enabled
+        self.records = []
+        self.sample_records = []
+
+    def log(self, message):
+        if self.enabled:
+            print(f"[combine-profile] {message}", flush=True)
+
+    @contextmanager
+    def step(self, name):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        rss_before = _current_rss_bytes()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - start
+            rss_after = _current_rss_bytes()
+            rss_delta = None if rss_before is None or rss_after is None else rss_after - rss_before
+            self.records.append((name, elapsed))
+            self.sample_records.append((name, elapsed))
+            self.log(
+                f"{name}: {elapsed:.6f}s, "
+                f"rss={_format_bytes(rss_after)}, delta={_format_bytes(rss_delta)}"
+            )
+
+    def start_sample(self, sample_num, file_path):
+        if not self.enabled:
+            return
+        self.sample_records = []
+        self.sample_start = time.perf_counter()
+        self.log(f"sample[{sample_num}] start: {file_path}, rss={_format_bytes(_current_rss_bytes())}")
+
+    def finish_sample(self, sample_num):
+        if not self.enabled:
+            return
+        elapsed = time.perf_counter() - self.sample_start
+        measured = sum(step_time for _, step_time in self.sample_records)
+        self.log(
+            f"sample[{sample_num}] total: {elapsed:.6f}s, "
+            f"measured_steps={measured:.6f}s, unmeasured={elapsed - measured:.6f}s"
+        )
+
+    def finish_all(self, sample_num):
+        if not self.enabled:
+            return
+        totals = {}
+        counts = {}
+        for name, elapsed in self.records:
+            totals[name] = totals.get(name, 0.0) + elapsed
+            counts[name] = counts.get(name, 0) + 1
+        self.log(f"processed samples: {sample_num}")
+        self.log("summary by step:")
+        for name, total in sorted(totals.items(), key=lambda item: item[1], reverse=True):
+            count = counts[name]
+            self.log(f"  {name}: total={total:.6f}s, count={count}, avg={total / count:.6f}s")
+
+
+def Process_Material_Dataset(mode, construct_kernel, root='./datasets/', save_pth_root = './data/', profile_combine=False):
+    profiler = CombineProfiler(enabled=profile_combine)
+    with profiler.step("open dataset files"):
+        dataset_file_r = open(root+mode+'_ori.txt', "r")
+        dataset_file_w = open(root+mode+'.txt', "w")
     sample_num = 0
-    for line in dataset_file_r.readlines():  
+    with profiler.step("read dataset file list"):
+        dataset_lines = dataset_file_r.readlines()
+    profiler.log(f"dataset entries: {len(dataset_lines)}")
+    for line in dataset_lines:
         file_path = line.strip()
-        sample = torch.load(file_path, weights_only=False, map_location='cpu')
-        input_data, _ = sample[0], sample[1]
-        H0, _, mask_tensor, edge_vec, edge_src, edge_dst, ele_list, output_path = input_data
-        node_num = max(int(max(edge_src)+1), int(max(edge_dst)+1))
-        H0_raw = H0*13.6
-        H0 = H0_raw.reshape((H0_raw.shape[0], 2, 27, 2, 27)) 
-        mask_tensor_raw = mask_tensor
-        mask_tensor = mask_tensor_raw.reshape((mask_tensor_raw.shape[0], 2, 27, 2, 27))
+        profiler.start_sample(sample_num, file_path)
+        with profiler.step("torch.load sample"):
+            sample = torch.load(file_path, weights_only=False, map_location='cpu')
+        with profiler.step("unpack input data"):
+            input_data, _ = sample[0], sample[1]
+            H0, _, mask_tensor, edge_vec, edge_src, edge_dst, ele_list, output_path = input_data
+        profiler.log(
+            "; ".join([
+                _tensor_summary("H0_loaded", H0),
+                _tensor_summary("mask_tensor_loaded", mask_tensor),
+                _tensor_summary("edge_vec_loaded", edge_vec),
+                _tensor_summary("edge_src_loaded", edge_src),
+                _tensor_summary("edge_dst_loaded", edge_dst),
+            ])
+        )
+        with profiler.step("compute node_num"):
+            node_num = max(int(max(edge_src)+1), int(max(edge_dst)+1))
+        profiler.log(f"node_num={node_num}, edge_count={edge_src.numel()}")
+        with profiler.step("scale H0 raw"):
+            H0_raw = H0*13.6
+        with profiler.step("reshape H0 to spin blocks"):
+            H0 = H0_raw.reshape((H0_raw.shape[0], 2, 27, 2, 27))
+        with profiler.step("reshape mask_tensor to spin blocks"):
+            mask_tensor_raw = mask_tensor
+            mask_tensor = mask_tensor_raw.reshape((mask_tensor_raw.shape[0], 2, 27, 2, 27))
         H0_convert_list = []
         mask_tensor_convert_list = []
         ls = [1, 1, 1, 1, 3, 3, 5, 5, 7]
         for d1 in [0,1]:
             for d2 in [0,1]:
-                descriptor_list = []
-                a = 0
-                for i in ls:
-                    b = 0
-                    for j in ls:
-                        descriptor_list.append(H0[:, d1, a:a+i, d2, b:b+j].reshape(H0.shape[0], -1))
-                        b += j
-                    a += i
-                H0_convert_list.append(torch.cat(descriptor_list, dim = -1).reshape((-1, 1, 27*27)))
-        H0 = torch.cat(H0_convert_list, dim = 1)
-        edge_vec, edge_src, edge_dst = edge_vec.reshape(edge_vec.shape[0], -1), edge_src.reshape(-1), edge_dst.reshape(-1)
-        H0_ds = construct_kernel.get_net_out(H0)
-        mask_tensor_raw = mask_tensor_raw.reshape((-1, 27, 2, 27, 2))
-        mask_tensor_raw = mask_tensor_raw.permute(0, 2, 1, 4, 3).reshape((-1, 54, 54))     
-        torch.save([file_path, H0_ds, edge_vec, edge_src, edge_dst, ele_list, H0_raw, mask_tensor_raw], file_path)
+                with profiler.step(f"convert H0 spin block d1={d1} d2={d2}"):
+                    descriptor_list = []
+                    a = 0
+                    for i in ls:
+                        b = 0
+                        for j in ls:
+                            descriptor_list.append(H0[:, d1, a:a+i, d2, b:b+j].reshape(H0.shape[0], -1))
+                            b += j
+                        a += i
+                    H0_convert_list.append(torch.cat(descriptor_list, dim = -1).reshape((-1, 1, 27*27)))
+        with profiler.step("cat converted H0 spin blocks"):
+            H0 = torch.cat(H0_convert_list, dim = 1)
+        profiler.log(_tensor_summary("H0_before_get_net_out", H0))
+        with profiler.step("reshape edge tensors"):
+            edge_vec, edge_src, edge_dst = edge_vec.reshape(edge_vec.shape[0], -1), edge_src.reshape(-1), edge_dst.reshape(-1)
+        with profiler.step("construct_kernel.get_net_out(H0)"):
+            H0_ds = construct_kernel.get_net_out(H0)
+        profiler.log(_tensor_summary("H0_ds_after_get_net_out", H0_ds))
+        with profiler.step("reshape and permute mask_tensor_raw"):
+            mask_tensor_raw = mask_tensor_raw.reshape((-1, 27, 2, 27, 2))
+            mask_tensor_raw = mask_tensor_raw.permute(0, 2, 1, 4, 3).reshape((-1, 54, 54))
+        with profiler.step("torch.save combined sample"):
+            torch.save([file_path, H0_ds, edge_vec, edge_src, edge_dst, ele_list, H0_raw, mask_tensor_raw], file_path)
         sample_num += 1
-        dataset_file_w.write(file_path)
+        with profiler.step("write combined dataset entry"):
+            dataset_file_w.write(file_path)
         print('save ', file_path)
-    dataset_file_w.close()
-    os.system('rm -rf '+root+mode+'_ori.txt')
+        profiler.finish_sample(sample_num - 1)
+    with profiler.step("close dataset files"):
+        dataset_file_r.close()
+        dataset_file_w.close()
+    with profiler.step("remove ori dataset list"):
+        os.system('rm -rf '+root+mode+'_ori.txt')
+    profiler.finish_all(sample_num)
     
 
 def get_hamiltonian_size(args, spinful):
@@ -259,7 +392,7 @@ def main(args):
     _log = FileLogger(is_master=True, is_rank0=True, output_dir=args.output_dir)
     _log.info(args)
     irreps_edge, construct_kernel = get_hamiltonian_size(args, spinful=True)
-    Process_Material_Dataset('infer', construct_kernel)
+    Process_Material_Dataset('infer', construct_kernel, profile_combine=args.profile_combine)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser('Processing Data', parents=[get_args_parser()])
